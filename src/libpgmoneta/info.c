@@ -1693,6 +1693,8 @@ pgmoneta_backup_size(int server, char* label, unsigned long* size, uint64_t* big
    char* manifest_path = NULL;
    unsigned long sz = 0;
    uint64_t biggest_file_sz = 0;
+   char* relative_path = NULL;
+   char* bare_file_name = NULL;
 
    config = (struct main_configuration*)shmem;
 
@@ -1726,8 +1728,6 @@ pgmoneta_backup_size(int server, char* label, unsigned long* size, uint64_t* big
       {
          struct rfile* rf = NULL;
          uint32_t block_length = 0;
-         char* relative_path = NULL;
-         char* bare_file_name = NULL;
 
          if (split_file_path(file_path, &relative_path, &bare_file_name))
          {
@@ -1735,7 +1735,7 @@ pgmoneta_backup_size(int server, char* label, unsigned long* size, uint64_t* big
             goto error;
          }
 
-         if (pgmoneta_incremental_rfile_initialize(server, label, relative_path, bare_file_name, ENCRYPTION_NONE, COMPRESSION_NONE, &rf))
+         if (pgmoneta_incremental_rfile_initialize(server, label, relative_path, bare_file_name, config->encryption, config->compression_type, &rf))
          {
             pgmoneta_log_error("Unable to create rfile %s", bare_file_name);
             goto error;
@@ -1758,6 +1758,8 @@ pgmoneta_backup_size(int server, char* label, unsigned long* size, uint64_t* big
          pgmoneta_rfile_destroy(rf);
          free(relative_path);
          free(bare_file_name);
+         relative_path = NULL;
+         bare_file_name = NULL;
       }
       /* for non-incremental files get the file size from manifest itself */
       else
@@ -1778,11 +1780,16 @@ pgmoneta_backup_size(int server, char* label, unsigned long* size, uint64_t* big
 
    pgmoneta_json_destroy(manifest_read);
    free(manifest_path);
+   free(relative_path);
+   free(bare_file_name);
    return 0;
 
 error:
+   pgmoneta_json_iterator_destroy(iter);
    pgmoneta_json_destroy(manifest_read);
    free(manifest_path);
+   free(relative_path);
+   free(bare_file_name);
    return 1;
 }
 

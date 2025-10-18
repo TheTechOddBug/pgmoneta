@@ -53,6 +53,18 @@
 // Forward declaration - will be available in utils.h after rebase
 unsigned long pgmoneta_calculate_wal_size(char* directory, char* start);
 
+MCTF_TEST_SETUP(utils)
+{
+   pgmoneta_test_config_save();
+   pgmoneta_memory_init();
+}
+
+MCTF_TEST_TEARDOWN(utils)
+{
+   pgmoneta_memory_destroy();
+   pgmoneta_test_config_restore();
+}
+
 MCTF_TEST(test_resolve_path_trailing_env_var)
 {
    char* resolved = NULL;

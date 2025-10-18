@@ -1485,7 +1485,7 @@ pgmoneta_snprintf(char* buf, size_t n, const char* fmt, ...)
 }
 
 char*
-pgmoneta_append(char* orig, char* s)
+pgmoneta_append(char* orig, const char* s)
 {
    size_t orig_length;
    size_t s_length;
@@ -3151,7 +3151,7 @@ error:
 }
 
 int
-pgmoneta_symlink_file(char* from, char* to)
+pgmoneta_symlink_file(const char* from, const char* to)
 {
    int ret;
 
