@@ -40,15 +40,19 @@
 #include <openssl/evp.h>
 #include <openssl/rand.h>
 
-#define NAME         "aes"
-#define ENC_BUF_SIZE (1024 * 1024)
+#define NAME               "aes"
+#define ENC_BUF_SIZE       (1024 * 1024)
+
+#define PBKDF2_ITERATIONS  600000
+#define PBKDF2_SALT_LENGTH 16
 
 static int encrypt_file(char* from, char* to, int enc);
-static int derive_key_iv(char* password, unsigned char* key, unsigned char* iv, int mode);
+static int derive_key_iv(char* password, unsigned char* salt, unsigned char* key, unsigned char* iv, int mode);
 static int aes_encrypt(char* plaintext, unsigned char* key, unsigned char* iv, char** ciphertext, int* ciphertext_length, int mode);
 static int aes_decrypt(char* ciphertext, int ciphertext_length, unsigned char* key, unsigned char* iv, char** plaintext, int mode);
 static const EVP_CIPHER* (*get_cipher(int mode))(void);
 static const EVP_CIPHER* (*get_cipher_buffer(int mode))(void);
+static int get_key_length(int mode);
 
 static void do_encrypt_file(struct worker_common* wc);
 static void do_decrypt_file(struct worker_common* wc);
@@ -800,16 +804,54 @@ pgmoneta_encrypt(char* plaintext, char* password, char** ciphertext, int* cipher
 {
    unsigned char key[EVP_MAX_KEY_LENGTH];
    unsigned char iv[EVP_MAX_IV_LENGTH];
+   unsigned char salt[PBKDF2_SALT_LENGTH];
+   char* encrypted = NULL;
+   int encrypted_length = 0;
+   char* output = NULL;
+   int ret = 1;
 
+   memset(&key, 0, sizeof(key));
+   memset(&iv, 0, sizeof(iv));
+
+   /* Generate a cryptographically random salt */
+   if (RAND_bytes(salt, PBKDF2_SALT_LENGTH) != 1)
+   {
+      goto cleanup;
+   }
+
+   if (derive_key_iv(password, salt, key, iv, mode) != 0)
+   {
+      goto cleanup;
+   }
+
+   if (aes_encrypt(plaintext, key, iv, &encrypted, &encrypted_length, mode) != 0)
+   {
+      goto cleanup;
+   }
+
+   /* Prepend salt to ciphertext: [salt][encrypted] */
+   output = malloc(PBKDF2_SALT_LENGTH + encrypted_length);
+   if (output == NULL)
+   {
+      goto cleanup;
+   }
+
+   memcpy(output, salt, PBKDF2_SALT_LENGTH);
+   memcpy(output + PBKDF2_SALT_LENGTH, encrypted, encrypted_length);
+
+   *ciphertext = output;
+   *ciphertext_length = PBKDF2_SALT_LENGTH + encrypted_length;
+
+   ret = 0;
+
+cleanup:
+   free(encrypted);
+
+   /* Wipe key material from stack */
    OPENSSL_cleanse(key, sizeof(key));
    OPENSSL_cleanse(iv, sizeof(iv));
 
-   if (derive_key_iv(password, key, iv, mode) != 0)
-   {
-      return 1;
-   }
-
-   return aes_encrypt(plaintext, key, iv, ciphertext, ciphertext_length, mode);
+   return ret;
 }
 
 int
@@ -817,30 +859,71 @@ pgmoneta_decrypt(char* ciphertext, int ciphertext_length, char* password, char**
 {
    unsigned char key[EVP_MAX_KEY_LENGTH];
    unsigned char iv[EVP_MAX_IV_LENGTH];
+   unsigned char salt[PBKDF2_SALT_LENGTH];
+   int ret = 1;
 
-   OPENSSL_cleanse(key, sizeof(key));
-   OPENSSL_cleanse(iv, sizeof(iv));
-
-   if (derive_key_iv(password, key, iv, mode) != 0)
+   /* The ciphertext must be at least salt_length + 1 byte */
+   if (ciphertext_length <= PBKDF2_SALT_LENGTH)
    {
       return 1;
    }
 
-   return aes_decrypt(ciphertext, ciphertext_length, key, iv, plaintext, mode);
+   memset(&key, 0, sizeof(key));
+   memset(&iv, 0, sizeof(iv));
+
+   /* Extract salt from the first PBKDF2_SALT_LENGTH bytes */
+   memcpy(salt, ciphertext, PBKDF2_SALT_LENGTH);
+
+   if (derive_key_iv(password, salt, key, iv, mode) != 0)
+   {
+      goto cleanup;
+   }
+
+   ret = aes_decrypt(ciphertext + PBKDF2_SALT_LENGTH,
+                     ciphertext_length - PBKDF2_SALT_LENGTH,
+                     key, iv, plaintext, mode);
+
+cleanup:
+   /* Wipe key material from stack */
+   OPENSSL_cleanse(key, sizeof(key));
+   OPENSSL_cleanse(iv, sizeof(iv));
+
+   return ret;
 }
 
 // [private]
 static int
-derive_key_iv(char* password, unsigned char* key, unsigned char* iv, int mode)
+derive_key_iv(char* password, unsigned char* salt, unsigned char* key, unsigned char* iv, int mode)
 {
-   if (!EVP_BytesToKey(get_cipher(mode)(), EVP_sha1(), NULL,
-                       (unsigned char*)password, strlen(password), 1,
-                       key, iv))
+   int key_length;
+   int iv_length;
+   unsigned char derived[EVP_MAX_KEY_LENGTH + EVP_MAX_IV_LENGTH];
+   int ret = 1;
+
+   key_length = get_key_length(mode);
+   iv_length = EVP_CIPHER_iv_length(get_cipher(mode)());
+
+   /* Derive key_length + iv_length bytes from password using PBKDF2 */
+   if (!PKCS5_PBKDF2_HMAC(password, strlen(password),
+                          salt, PBKDF2_SALT_LENGTH,
+                          PBKDF2_ITERATIONS,
+                          EVP_sha256(),
+                          key_length + iv_length,
+                          derived))
    {
-      return 1;
+      goto cleanup;
    }
 
-   return 0;
+   memcpy(key, derived, key_length);
+   memcpy(iv, derived + key_length, iv_length);
+
+   ret = 0;
+
+cleanup:
+   /* Wipe sensitive derived material */
+   OPENSSL_cleanse(derived, sizeof(derived));
+
+   return ret;
 }
 
 // [private]
@@ -1007,6 +1090,7 @@ encrypt_file(char* from, char* to, int enc)
 {
    unsigned char key[EVP_MAX_KEY_LENGTH];
    unsigned char iv[EVP_MAX_IV_LENGTH];
+   unsigned char salt[PBKDF2_SALT_LENGTH];
    char* master_key = NULL;
    EVP_CIPHER_CTX* ctx = NULL;
    struct main_configuration* config;
@@ -1019,6 +1103,7 @@ encrypt_file(char* from, char* to, int enc)
    int inl = 0;
    int outl = 0;
    int f_len = 0;
+   int ret = 1;
 
    config = (struct main_configuration*)shmem;
    cipher_fp = get_cipher(config->encryption);
@@ -1035,10 +1120,43 @@ encrypt_file(char* from, char* to, int enc)
    }
    memset(&key, 0, sizeof(key));
    memset(&iv, 0, sizeof(iv));
-   if (derive_key_iv(master_key, key, iv, config->encryption) != 0)
+
+   if (enc == 1)
    {
-      pgmoneta_log_error("derive_key_iv: Failed to derive key and iv");
-      goto error;
+      /* Encryption: generate a random salt */
+      if (RAND_bytes(salt, PBKDF2_SALT_LENGTH) != 1)
+      {
+         pgmoneta_log_error("RAND_bytes: Failed to generate salt");
+         goto error;
+      }
+
+      if (derive_key_iv(master_key, salt, key, iv, config->encryption) != 0)
+      {
+         pgmoneta_log_error("derive_key_iv: Failed to derive key and iv");
+         goto error;
+      }
+   }
+   else
+   {
+      /* Decryption: extract salt from the file */
+      in = fopen(from, "rb");
+      if (in == NULL)
+      {
+         pgmoneta_log_error("fopen: Could not open %s", from);
+         goto error;
+      }
+
+      if (fread(salt, sizeof(char), PBKDF2_SALT_LENGTH, in) != PBKDF2_SALT_LENGTH)
+      {
+         pgmoneta_log_error("fread: failed to read salt from %s", from);
+         goto error;
+      }
+
+      if (derive_key_iv(master_key, salt, key, iv, config->encryption) != 0)
+      {
+         pgmoneta_log_error("derive_key_iv: Failed to derive key and iv");
+         goto error;
+      }
    }
 
    if (!(ctx = EVP_CIPHER_CTX_new()))
@@ -1047,11 +1165,14 @@ encrypt_file(char* from, char* to, int enc)
       goto error;
    }
 
-   in = fopen(from, "rb");
-   if (in == NULL)
+   if (enc == 1)
    {
-      pgmoneta_log_error("fopen: Could not open %s", from);
-      goto error;
+      in = fopen(from, "rb");
+      if (in == NULL)
+      {
+         pgmoneta_log_error("fopen: Could not open %s", from);
+         goto error;
+      }
    }
 
    out = fopen(to, "w");
@@ -1059,6 +1180,16 @@ encrypt_file(char* from, char* to, int enc)
    {
       pgmoneta_log_error("fopen: Could not open %s", to);
       goto error;
+   }
+
+   if (enc == 1)
+   {
+      /* Prepend salt to the output file */
+      if (fwrite(salt, sizeof(char), PBKDF2_SALT_LENGTH, out) != PBKDF2_SALT_LENGTH)
+      {
+         pgmoneta_log_error("fwrite: failed to write salt");
+         goto error;
+      }
    }
 
    if (EVP_CipherInit_ex(ctx, cipher_fp(), NULL, key, iv, enc) == 0)
@@ -1102,23 +1233,23 @@ encrypt_file(char* from, char* to, int enc)
       }
    }
 
-   if (ctx)
-   {
-      EVP_CIPHER_CTX_free(ctx);
-   }
-   free(master_key);
-   fclose(in);
-   fflush(out);
-   fclose(out);
-   return 0;
+   ret = 0;
 
-error:
+cleanup:
    if (ctx)
    {
       EVP_CIPHER_CTX_free(ctx);
    }
 
-   free(master_key);
+   /* Wipe key material from stack */
+   OPENSSL_cleanse(key, sizeof(key));
+   OPENSSL_cleanse(iv, sizeof(iv));
+
+   if (master_key != NULL)
+   {
+      OPENSSL_cleanse(master_key, strlen(master_key));
+      free(master_key);
+   }
 
    if (in != NULL)
    {
@@ -1131,7 +1262,10 @@ error:
       fclose(out);
    }
 
-   return 1;
+   return ret;
+
+error:
+   goto cleanup;
 }
 
 int
@@ -1151,6 +1285,7 @@ encrypt_decrypt_buffer(unsigned char* origin_buffer, size_t origin_size, unsigne
 {
    unsigned char key[EVP_MAX_KEY_LENGTH];
    unsigned char iv[EVP_MAX_IV_LENGTH];
+   unsigned char salt[PBKDF2_SALT_LENGTH];
    char* master_key = NULL;
    EVP_CIPHER_CTX* ctx = NULL;
    const EVP_CIPHER* (*cipher_fp)(void) = NULL;
@@ -1158,6 +1293,11 @@ encrypt_decrypt_buffer(unsigned char* origin_buffer, size_t origin_size, unsigne
    size_t outbuf_size = 0;
    size_t outl = 0;
    size_t f_len = 0;
+   unsigned char* actual_input = NULL;
+   size_t actual_input_size = 0;
+   int ret = 1;
+
+   *res_buffer = NULL;
 
    cipher_fp = get_cipher_buffer(mode);
    if (cipher_fp == NULL)
@@ -1168,22 +1308,6 @@ encrypt_decrypt_buffer(unsigned char* origin_buffer, size_t origin_size, unsigne
 
    cipher_block_size = EVP_CIPHER_block_size(cipher_fp());
 
-   if (enc == 1)
-   {
-      outbuf_size = origin_size + cipher_block_size;
-   }
-   else
-   {
-      outbuf_size = origin_size;
-   }
-
-   *res_buffer = (unsigned char*)malloc(outbuf_size + 1);
-   if (*res_buffer == NULL)
-   {
-      pgmoneta_log_error("pgmoneta_encrypt_decrypt_buffer: Allocation failure");
-      goto error;
-   }
-
    if (pgmoneta_get_master_key(&master_key))
    {
       pgmoneta_log_error("pgmoneta_get_master_key: Invalid master key");
@@ -1193,62 +1317,146 @@ encrypt_decrypt_buffer(unsigned char* origin_buffer, size_t origin_size, unsigne
    memset(&key, 0, sizeof(key));
    memset(&iv, 0, sizeof(iv));
 
-   if (derive_key_iv(master_key, key, iv, mode) != 0)
+   if (enc == 1)
    {
-      pgmoneta_log_error("derive_key_iv: Failed to derive key and iv");
-      goto error;
+      /* Encryption: generate a random salt */
+      if (RAND_bytes(salt, PBKDF2_SALT_LENGTH) != 1)
+      {
+         pgmoneta_log_error("RAND_bytes: Failed to generate salt");
+         goto error;
+      }
+
+      if (derive_key_iv(master_key, salt, key, iv, mode) != 0)
+      {
+         pgmoneta_log_error("derive_key_iv: Failed to derive key and iv");
+         goto error;
+      }
+
+      /* Output buffer: salt + encrypted data + padding */
+      outbuf_size = PBKDF2_SALT_LENGTH + origin_size + cipher_block_size;
+      *res_buffer = (unsigned char*)malloc(outbuf_size + 1);
+      if (*res_buffer == NULL)
+      {
+         pgmoneta_log_error("pgmoneta_encrypt_decrypt_buffer: Allocation failure");
+         goto error;
+      }
+
+      /* Prepend salt */
+      memcpy(*res_buffer, salt, PBKDF2_SALT_LENGTH);
+
+      if (!(ctx = EVP_CIPHER_CTX_new()))
+      {
+         pgmoneta_log_error("EVP_CIPHER_CTX_new: Failed to create context");
+         goto error;
+      }
+
+      if (EVP_CipherInit_ex(ctx, cipher_fp(), NULL, key, iv, enc) == 0)
+      {
+         pgmoneta_log_error("EVP_CipherInit_ex: Failed to initialize cipher context");
+         goto error;
+      }
+
+      if (EVP_CipherUpdate(ctx, *res_buffer + PBKDF2_SALT_LENGTH, (int*)&outl, origin_buffer, origin_size) == 0)
+      {
+         pgmoneta_log_error("EVP_CipherUpdate: Failed to process data");
+         goto error;
+      }
+
+      *res_size = PBKDF2_SALT_LENGTH + outl;
+
+      if (EVP_CipherFinal_ex(ctx, *res_buffer + PBKDF2_SALT_LENGTH + outl, (int*)&f_len) == 0)
+      {
+         pgmoneta_log_error("EVP_CipherFinal_ex: Failed to finalize operation");
+         goto error;
+      }
+
+      *res_size += f_len;
    }
-
-   if (!(ctx = EVP_CIPHER_CTX_new()))
+   else
    {
-      pgmoneta_log_error("EVP_CIPHER_CTX_new: Failed to create context");
-      goto error;
-   }
+      /* Decryption: extract salt from the first PBKDF2_SALT_LENGTH bytes */
+      if (origin_size <= PBKDF2_SALT_LENGTH)
+      {
+         pgmoneta_log_error("encrypt_decrypt_buffer: Input too short for decryption");
+         goto error;
+      }
 
-   if (EVP_CipherInit_ex(ctx, cipher_fp(), NULL, key, iv, enc) == 0)
-   {
-      pgmoneta_log_error("EVP_CipherInit_ex: Failed to initialize cipher context");
-      goto error;
-   }
+      memcpy(salt, origin_buffer, PBKDF2_SALT_LENGTH);
+      actual_input = origin_buffer + PBKDF2_SALT_LENGTH;
+      actual_input_size = origin_size - PBKDF2_SALT_LENGTH;
 
-   if (EVP_CipherUpdate(ctx, *res_buffer, (int*)&outl, origin_buffer, origin_size) == 0)
-   {
-      pgmoneta_log_error("EVP_CipherUpdate: Failed to process data");
-      goto error;
-   }
+      if (derive_key_iv(master_key, salt, key, iv, mode) != 0)
+      {
+         pgmoneta_log_error("derive_key_iv: Failed to derive key and iv");
+         goto error;
+      }
 
-   *res_size = outl;
+      outbuf_size = actual_input_size;
+      *res_buffer = (unsigned char*)malloc(outbuf_size + 1);
+      if (*res_buffer == NULL)
+      {
+         pgmoneta_log_error("pgmoneta_encrypt_decrypt_buffer: Allocation failure");
+         goto error;
+      }
 
-   if (EVP_CipherFinal_ex(ctx, *res_buffer + outl, (int*)&f_len) == 0)
-   {
-      pgmoneta_log_error("EVP_CipherFinal_ex: Failed to finalize operation");
-      goto error;
-   }
+      if (!(ctx = EVP_CIPHER_CTX_new()))
+      {
+         pgmoneta_log_error("EVP_CIPHER_CTX_new: Failed to create context");
+         goto error;
+      }
 
-   *res_size += f_len;
+      if (EVP_CipherInit_ex(ctx, cipher_fp(), NULL, key, iv, enc) == 0)
+      {
+         pgmoneta_log_error("EVP_CipherInit_ex: Failed to initialize cipher context");
+         goto error;
+      }
 
-   if (enc == 0)
-   {
+      if (EVP_CipherUpdate(ctx, *res_buffer, (int*)&outl, actual_input, actual_input_size) == 0)
+      {
+         pgmoneta_log_error("EVP_CipherUpdate: Failed to process data");
+         goto error;
+      }
+
+      *res_size = outl;
+
+      if (EVP_CipherFinal_ex(ctx, *res_buffer + outl, (int*)&f_len) == 0)
+      {
+         pgmoneta_log_error("EVP_CipherFinal_ex: Failed to finalize operation");
+         goto error;
+      }
+
+      *res_size += f_len;
       (*res_buffer)[*res_size] = '\0';
    }
 
-   EVP_CIPHER_CTX_free(ctx);
-   free(master_key);
+   ret = 0;
 
-   return 0;
-
-error:
+cleanup:
    if (ctx)
    {
       EVP_CIPHER_CTX_free(ctx);
    }
 
-   free(*res_buffer);
-   *res_buffer = NULL;
+   /* Wipe key material from stack */
+   OPENSSL_cleanse(key, sizeof(key));
+   OPENSSL_cleanse(iv, sizeof(iv));
 
-   free(master_key);
+   if (master_key != NULL)
+   {
+      OPENSSL_cleanse(master_key, strlen(master_key));
+      free(master_key);
+   }
 
-   return 1;
+   if (ret != 0 && *res_buffer != NULL)
+   {
+      free(*res_buffer);
+      *res_buffer = NULL;
+   }
+
+   return ret;
+
+error:
+   goto cleanup;
 }
 
 static const EVP_CIPHER* (*get_cipher_buffer(int mode))(void)
@@ -1273,8 +1481,11 @@ create_aes_encryptor(int mode, struct encryptor** encryptor)
 {
    struct aes_encryptor* ae = NULL;
    char* master_key = NULL;
+   unsigned char salt[PBKDF2_SALT_LENGTH];
+
    ae = (struct aes_encryptor*)malloc(sizeof(struct aes_encryptor));
    memset(ae, 0, sizeof(struct aes_encryptor));
+   memset(salt, 0, sizeof(salt));
 
    ae->super.close = aes_encryptor_close;
    ae->super.decrypt = aes_encryptor_decrypt;
@@ -1287,19 +1498,29 @@ create_aes_encryptor(int mode, struct encryptor** encryptor)
       goto error;
    }
 
-   if (derive_key_iv(master_key, ae->key, ae->iv, mode) != 0)
+   if (derive_key_iv(master_key, salt, ae->key, ae->iv, mode) != 0)
    {
       pgmoneta_log_error("derive_key_iv: Failed to derive key and iv");
       goto error;
    }
 
-   free(master_key);
+   if (master_key != NULL)
+   {
+      OPENSSL_cleanse(master_key, strlen(master_key));
+      free(master_key);
+   }
+
    *encryptor = (struct encryptor*)ae;
 
    return 0;
 
 error:
-   free(master_key);
+   if (master_key != NULL)
+   {
+      OPENSSL_cleanse(master_key, strlen(master_key));
+      free(master_key);
+   }
+
    pgmoneta_encryptor_destroy((struct encryptor*)ae);
    return 1;
 }
@@ -1458,4 +1679,23 @@ noop_encryptor_decrypt(struct encryptor* encryptor, void* in_buf, size_t in_size
    return 0;
 error:
    return 1;
+}
+
+static int
+get_key_length(int mode)
+{
+   switch (mode)
+   {
+      case ENCRYPTION_AES_256_CBC:
+      case ENCRYPTION_AES_256_CTR:
+         return 32;
+      case ENCRYPTION_AES_192_CBC:
+      case ENCRYPTION_AES_192_CTR:
+         return 24;
+      case ENCRYPTION_AES_128_CBC:
+      case ENCRYPTION_AES_128_CTR:
+         return 16;
+      default:
+         return 32;
+   }
 }
